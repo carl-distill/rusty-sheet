@@ -24,22 +24,30 @@ pub(super) fn write_to_vector(sheet: &Sheet, column: &Column, cell: &Cell, vecto
             message,
         )
     };
-    match (column.kind, cell.kind) {
-        (ColumnType::Varchar, CellType::SharedString) => {
-            let index = cell.value.parse::<usize>()?;
-            if let Some(shared_string) = &shared_strings[index] {
-                vector.insert(row, shared_string);
-            } else {
-                vector.set_null(row);
+    let cell = if cell.kind == CellType::SharedString {
+        let index = cell.value.parse::<usize>()?;
+        if let Some(shared_string) = &shared_strings[index] {
+            &Cell {
+                row: cell.row,
+                col: cell.col,
+                kind: cell.kind,
+                value: shared_string.to_owned(),
             }
+        } else {
+            vector.set_null(row);
+            return Ok(());
         }
-        (ColumnType::Varchar, _) => vector.insert(row, &cell.to_string()),
-        (ColumnType::Boolean, _) => write_primitive(vector, row, cell.to_boolean()),
-        (ColumnType::BigInt, _) => write_primitive(vector, row, cell.to_bigint().map_err(mapper)?),
-        (ColumnType::Double, _) => write_primitive(vector, row, cell.to_double().map_err(mapper)?),
-        (ColumnType::Timestamp, _) => write_timestamp(vector, row, cell.to_datetime().map_err(mapper)?),
-        (ColumnType::Date, _) => write_date(vector, row, cell.to_date().map_err(mapper)?),
-        (ColumnType::Time, _) => write_time(vector, row, cell.to_time().map_err(mapper)?),
+    } else {
+        cell
+    };
+    match column.kind {
+        ColumnType::Varchar => vector.insert(row, &cell.to_string()),
+        ColumnType::Boolean => write_primitive(vector, row, cell.to_boolean()),
+        ColumnType::BigInt => write_primitive(vector, row, cell.to_bigint().map_err(mapper)?),
+        ColumnType::Double => write_primitive(vector, row, cell.to_double().map_err(mapper)?),
+        ColumnType::Timestamp => write_timestamp(vector, row, cell.to_datetime().map_err(mapper)?),
+        ColumnType::Date => write_date(vector, row, cell.to_date().map_err(mapper)?),
+        ColumnType::Time => write_time(vector, row, cell.to_time().map_err(mapper)?),
     }
     Ok(())
 }

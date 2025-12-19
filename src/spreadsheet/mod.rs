@@ -71,7 +71,7 @@ pub(crate) trait Spreadsheet {
     /// automatically. Supports header detection and type presets.
     fn analyze_sheets(&mut self, has_header: bool, criteria: &Criteria, presets: &Vec<(Pattern, ColumnType)>) -> Result<Vec<Table>, RustySheetError> {
         let mut shared_indexes = HashSet::<usize>::new();
-        let mut sheets = Vec::<(String, Vec<Option<Cell>>, Vec<ColumnType>, Option<usize>, usize, usize)>::new();
+        let mut sheets = Vec::<(String, Vec<Option<Cell>>, Vec<Vec<Cell>>, Option<usize>, usize, usize)>::new();
         for sheet in self.read_sheets(criteria)? {
             let row_lower_bound = criteria.range.and_then(|it| it.row_lower_bound).or(sheet.row_lower_bound);
             let col_lower_bound = criteria.range.and_then(|it| it.col_lower_bound).or(sheet.col_lower_bound);
@@ -97,18 +97,10 @@ pub(crate) trait Spreadsheet {
                 }
             }
 
-            let kinds = (col_lower_bound..=col_upper_bound).map(|col| {
-                let index = col - col_lower_bound;
-                let types = data[index].iter()
-                    .map(|cell| ColumnType::from(&cell.kind, &cell.value))
-                    .collect::<Vec<_>>();
-                ColumnType::detect(types)
-            }).collect::<Vec<_>>();
-
             sheets.push((
                 sheet.name.to_owned(),
                 header,
-                kinds,
+                data,
                 row_lower_bound.map(|row| if has_header { row + 1 } else { row }),
                 col_lower_bound,
                 col_upper_bound,
@@ -117,7 +109,7 @@ pub(crate) trait Spreadsheet {
         let (shared_strings, mappings) = self.load_shared_strings(Some(shared_indexes))?;
 
         let mut tables = Vec::<Table>::new();
-        for (name, header, kinds, row_lower_bound, col_lower_bound, col_upper_bound) in sheets.into_iter() {
+        for (name, header, data, row_lower_bound, col_lower_bound, col_upper_bound) in sheets.into_iter() {
             let names = (col_lower_bound..=col_upper_bound).map(|col| {
                 let index = col - col_lower_bound;
                 if let Some(cell) = &header[index] {
@@ -138,14 +130,30 @@ pub(crate) trait Spreadsheet {
                 }
             }).collect::<Vec<_>>();
 
-            let columns = names.iter().zip(kinds)
-                .map(|(name, kind)| {
+            let columns = names.iter().zip(data)
+                .map(|(name, cells)| {
+                    let types = cells.iter()
+                        .map(|cell| {
+                            if cell.kind == CellType::SharedString {
+                                let id = cell.value.parse::<usize>().expect("Shared string index");
+                                let index = mappings[&id];
+                                let value = shared_strings[index].as_str();
+                                ColumnType::from(if criteria.nulls.contains(value) {
+                                    &CellType::Empty
+                                } else {
+                                    &cell.kind
+                                }, value)
+                            } else {
+                                ColumnType::from(&cell.kind, &cell.value)
+                            }
+                        })
+                        .collect::<Vec<_>>();
                     Column {
                         name: name.to_owned(),
                         kind: presets.iter()
                             .find(|(pattern, _)| pattern.matches(name))
                             .map(|(_, kind)| kind.to_owned())
-                            .unwrap_or(kind.to_owned()),
+                            .unwrap_or(ColumnType::detect(types)),
                     }
                 })
                 .collect::<Vec<_>>();
