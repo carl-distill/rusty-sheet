@@ -6,6 +6,8 @@ use crate::helpers::xml::XmlReader;
 use crate::helpers::xml::XmlTextContextHelper;
 use crate::helpers::zip::ZipHelper;
 use crate::match_xml_events;
+use crate::spreadsheet::Spreadsheet;
+use crate::spreadsheet::SpreadsheetError;
 use crate::spreadsheet::cell::Cell;
 use crate::spreadsheet::cell::CellType;
 use crate::spreadsheet::criteria::Criteria;
@@ -14,16 +16,14 @@ use crate::spreadsheet::excel::load_relationships;
 use crate::spreadsheet::reference::index_to_reference;
 use crate::spreadsheet::reference::reference_to_index;
 use crate::spreadsheet::sheet::Sheet;
-use crate::spreadsheet::Spreadsheet;
-use crate::spreadsheet::SpreadsheetError;
 use quick_xml::events::Event;
 use quick_xml::name::QName;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::BufReader;
-use zip::read::ZipFile;
 use zip::ZipArchive;
+use zip::read::ZipFile;
 
 // XML tag names for parsing Excel XLSX format
 const TAG_CUSTOM_FORMATS: QName = QName(b"numFmts"); // Custom number formats container
@@ -39,6 +39,8 @@ const TAG_ROW: QName = QName(b"row");                 // Row in worksheet
 const TAG_CELL: QName = QName(b"c");                  // Cell in worksheet
 const TAG_INLINE_STRING: QName = QName(b"is");        // Inline string value
 const TAG_VALUE: QName = QName(b"v");                 // Cell value content
+const TAG_MERGE_CELLS: QName = QName(b"mergeCells"); // Merged cells container
+const TAG_MERGE_CELL: QName = QName(b"mergeCell"); // Individual merged cell range
 
 /// Represents an Excel XLSX spreadsheet file
 pub(crate) struct XlsxSpreadsheet {
@@ -149,8 +151,57 @@ impl Spreadsheet for XlsxSpreadsheet {
             let mut col = 0usize;
             let mut kind = CellType::default();
             let mut value = String::new();
+
+            // Only allocate merged cell data structures when needed
+            let (mut merged_cell_map, mut merged_ranges, mut seen_cells, mut merged_cell_values) = if criteria.spread_merged_cells {
+                (
+                    HashMap::<(usize, usize), (usize, usize)>::new(),
+                    HashMap::<(usize, usize), (usize, usize, usize, usize)>::new(),
+                    HashSet::<(usize, usize)>::new(),
+                    HashMap::<(usize, usize), (CellType, String)>::new(),
+                )
+            } else {
+                // Use empty placeholders - these won't be accessed when spread_merged_cells is false
+                (
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashSet::new(),
+                    HashMap::new(),
+                )
+            };
+
+            // Single pass: Read cells and collect merged cell ranges
             let mut reader = self.zip.xml_reader(zip_path)?.expect(sheet_name);
+            let mut in_merge_cells = false;
+            
             match_xml_events!(reader => {
+                // Collect merged cell ranges
+                Event::Start(event) if criteria.spread_merged_cells && event.name() == TAG_MERGE_CELLS => {
+                    in_merge_cells = true;
+                }
+                Event::End(event) if criteria.spread_merged_cells && event.name() == TAG_MERGE_CELLS => {
+                    in_merge_cells = false;
+                }
+                Event::Start(event) if criteria.spread_merged_cells && in_merge_cells && event.name() == TAG_MERGE_CELL => {
+                    if let Some(ref_attr) = event.get_attribute_value("ref")? {
+                        if let Some((top_row, top_col, bottom_row, bottom_col)) = parse_merge_range(&ref_attr) {
+                            merged_ranges.insert((top_row, top_col), (top_row, top_col, bottom_row, bottom_col));
+                            // Pre-compute all cells in merged ranges for fast lookup
+                            let row_count = (bottom_row - top_row + 1) as usize;
+                            let col_count = (bottom_col - top_col + 1) as usize;
+                            if merged_cell_map.is_empty() {
+                                merged_cell_map.reserve(row_count * col_count);
+                            }
+                            for merged_row in top_row..=bottom_row {
+                                for merged_col in top_col..=bottom_col {
+                                    merged_cell_map.insert((merged_row, merged_col), (top_row, top_col));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Read cells normally
                 Event::End(event) if event.name() == TAG_ROW => {
                     row_count += 1;
                     col_count = 0;
@@ -162,7 +213,11 @@ impl Spreadsheet for XlsxSpreadsheet {
                     col_count += 1;
                     if sheet.after_row_upper_bound(row) {
                         break;
-                    } else if sheet.contains(row, col) {
+                    }
+                    let cell_in_range = sheet.contains(row, col);
+                    // When spread_merged_cells is enabled, read cell type for all cells
+                    // (we need values for top-left cells even if outside range)
+                    if cell_in_range || criteria.spread_merged_cells {
                         kind = event.get_attribute_value("t")?.map(|t| {
                             match t.as_ref() {
                                 "inlineStr" | "str" => CellType::InlineString,
@@ -191,18 +246,36 @@ impl Spreadsheet for XlsxSpreadsheet {
                 }
                 Event::End(event) if kind != CellType::Empty && !criteria.nulls.contains(&value) && event.name() == TAG_CELL => {
                     if kind != CellType::Error {
-                        if let Some(last_row) = last_row {
-                            if criteria.end_at_empty_row && ((sheet.is_empty() && last_row != row) || (!sheet.is_empty() && last_row + 1 < row)) {
-                                break;
-                            }
+                        let cell_in_range = sheet.contains(row, col);
+                        
+                        // When spread_merged_cells is enabled, store ALL cell values
+                        // (we'll use them in post-processing to fill merged cells)
+                        if criteria.spread_merged_cells {
+                            merged_cell_values.insert((row, col), (kind, value.clone()));
                         }
-                        last_row = Some(row);
-                        sheet.push(Cell {
-                            row,
-                            col,
-                            kind,
-                            value: value.to_owned(),
-                        });
+                        
+                        // Only add to sheet if in range
+                        if cell_in_range {
+                            if let Some(last_row) = last_row {
+                                if criteria.end_at_empty_row && ((sheet.is_empty() && last_row != row) || (!sheet.is_empty() && last_row + 1 < row)) {
+                                    break;
+                                }
+                            }
+                            last_row = Some(row);
+
+                            // Track that we've seen this cell (only needed for merged cells)
+                            if criteria.spread_merged_cells {
+                                seen_cells.insert((row, col));
+                            }
+
+                            // Add the cell to the sheet
+                            sheet.push(Cell {
+                                row,
+                                col,
+                                kind,
+                                value: value.clone(),
+                            });
+                        }
                         value.clear();
                     } else {
                         let reference = index_to_reference(row, col);
@@ -213,8 +286,67 @@ impl Spreadsheet for XlsxSpreadsheet {
                             value.to_owned(),
                         ))?
                     }
+                }
+                Event::End(event) if event.name() == TAG_CELL => {
+                    value.clear();
                 },
             });
+
+            // Post-processing: Fill in merged values for cells that are part of merged ranges
+            // In Excel XML, only the top-left cell of a merged range appears.
+            // We need to generate cells for all other positions in merged ranges that are in our range.
+            if criteria.spread_merged_cells && !merged_ranges.is_empty() {
+                for (&(top_row, top_col), &(_, _, bottom_row, bottom_col)) in &merged_ranges {
+                    // Get the stored value from the top-left cell
+                    if let Some(&(stored_kind, ref stored_value)) = merged_cell_values.get(&(top_row, top_col)) {
+                        // Iterate through all cells in the merged range
+                        for merged_row in top_row..=bottom_row {
+                            for merged_col in top_col..=bottom_col {
+                                // Skip the top-left cell (already processed)
+                                if (merged_row, merged_col) == (top_row, top_col) {
+                                    continue;
+                                }
+
+                                // Only generate cells that are in the requested range
+                                if !sheet.contains(merged_row, merged_col) {
+                                    continue;
+                                }
+
+                                // Only generate if this cell wasn't seen in the XML
+                                if seen_cells.contains(&(merged_row, merged_col)) {
+                                    continue;
+                                }
+
+                                // Check if we're still within bounds
+                                if sheet.after_row_upper_bound(merged_row) {
+                                    continue;
+                                }
+
+                                // Generate the cell with the value from the top-left
+                                // Note: We don't check end_at_empty_row here because:
+                                // 1. end_at_empty_row was already applied during the main pass
+                                // 2. We're just filling in cells that should exist based on merged ranges
+                                // 3. These cells are part of the same merged range as cells we already processed
+                                sheet.push(Cell {
+                                    row: merged_row,
+                                    col: merged_col,
+                                    kind: stored_kind,
+                                    value: stored_value.clone(),
+                                });
+                                seen_cells.insert((merged_row, merged_col));
+                            }
+                        }
+                    }
+                }
+
+                // Sort cells by (row, col) to ensure correct ordering for chunk method
+                // The chunk method expects cells to be in sorted order
+                sheet.cells.sort_by(|a, b| match a.row.cmp(&b.row) {
+                    std::cmp::Ordering::Equal => a.col.cmp(&b.col),
+                    other => other,
+                });
+            }
+
             sheet.finish(criteria.end_at_empty_row);
             sheets.push(sheet);
         }
@@ -330,6 +462,29 @@ fn load_number_formats(zip: &mut ZipArchive<UnifiedReader>, is_1904: bool) -> Re
     });
 
     Ok(excel::load_number_formats(format_indexes, custom_formats, is_1904))
+}
+
+/// Parses a merged cell range reference (e.g., "A1:B2") into row and column indices
+///
+/// # Arguments
+/// * `range_ref` - Excel range reference like "A1:B2"
+///
+/// # Returns
+/// Some((top_row, top_col, bottom_row, bottom_col)) if valid, None otherwise
+fn parse_merge_range(range_ref: &str) -> Option<(usize, usize, usize, usize)> {
+    // Split by colon to get start and end cells
+    let parts: Vec<&str> = range_ref.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let start_ref = parts[0].trim();
+    let end_ref = parts[1].trim();
+
+    let (top_row, top_col) = reference_to_index(start_ref)?;
+    let (bottom_row, bottom_col) = reference_to_index(end_ref)?;
+
+    Some((top_row, top_col, bottom_row, bottom_col))
 }
 
 /// Reads string value from XML content, handling text and CDATA sections

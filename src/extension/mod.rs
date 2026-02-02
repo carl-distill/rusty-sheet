@@ -86,6 +86,7 @@ struct NullsParam;
 struct ErrorAsNullParam;
 struct SkipEmptyRowsParam;
 struct EndAtEmptyRowParam;
+struct SpreadMergedCellsParam;
 struct FileNameColumnParam;
 struct SheetNameColumnParam;
 
@@ -305,6 +306,21 @@ impl NamedParam<bool> for SkipEmptyRowsParam {
 impl NamedParam<bool> for EndAtEmptyRowParam {
     fn name() -> &'static str {
         "end_at_empty_row"
+    }
+
+    fn kind() -> LogicalTypeHandle {
+        LogicalTypeHandle::from(LogicalTypeId::Boolean)
+    }
+
+    fn cast(value: Value) -> Result<bool, RustySheetError> {
+        Ok(value.to_bool())
+    }
+}
+
+/// Parameter handler for spreading data from merged cells across merged ranges.
+impl NamedParam<bool> for SpreadMergedCellsParam {
+    fn name() -> &'static str {
+        "spread_merged_cells"
     }
 
     fn kind() -> LogicalTypeHandle {

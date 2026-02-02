@@ -11,6 +11,7 @@ use crate::extension::Param;
 use crate::extension::Range;
 use crate::extension::RangeParam;
 use crate::extension::SheetParam;
+use crate::extension::SpreadMergedCellsParam;
 use crate::spreadsheet::criteria::Criteria;
 use crate::spreadsheet::open_spreadsheet;
 use duckdb::core::DataChunkHandle;
@@ -42,6 +43,8 @@ struct AnalyzeSheetParameters {
     nulls: Option<HashSet<String>>,
     /// Whether to convert errors to null values (default: false)
     error_as_null: Option<bool>,
+    /// Whether to spread merged cells across merged ranges (default: false)
+    spread_merged_cells: Option<bool>,
 }
 
 impl TryFrom<&BindInfo> for AnalyzeSheetParameters {
@@ -57,6 +60,7 @@ impl TryFrom<&BindInfo> for AnalyzeSheetParameters {
             analyze_rows: AnalyzeRowsParam::read(bind)?,
             nulls: NullsParam::read(bind)?,
             error_as_null: ErrorAsNullParam::read(bind)?,
+            spread_merged_cells: SpreadMergedCellsParam::read(bind)?
         })
     }
 }
@@ -89,6 +93,7 @@ impl TryFrom<&AnalyzeSheetParameters> for AnalyzeSheetBindData {
             error_as_null: parameters.error_as_null.unwrap_or(false),
             skip_empty_rows: false,
             end_at_empty_row: false,
+            spread_merged_cells: parameters.spread_merged_cells.unwrap_or(false),
         }, &Vec::new())? {
             for column in &table.columns {
                 columns.push((
