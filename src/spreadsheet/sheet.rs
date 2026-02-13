@@ -155,7 +155,13 @@ impl Sheet {
         if self.col_upper_bound.map(|col_upper_bound| col_upper_bound < col).unwrap_or(true) {
             self.col_upper_bound = Some(col);
         }
-        self.row_upper_bound = Some(row);
+        // Update row_upper_bound to the maximum row seen
+        // Optimize for common case: if row_upper_bound is None or row >= current max, update directly
+        match self.row_upper_bound {
+            None => self.row_upper_bound = Some(row),
+            Some(current_max) if row > current_max => self.row_upper_bound = Some(row),
+            _ => {} // row <= current_max, no update needed
+        }
     }
 
     /// Finalizes chunk creation after all cells have been added.

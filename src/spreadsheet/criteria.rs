@@ -28,6 +28,9 @@ pub(crate) struct Criteria {
 
     /// Stop reading when encountering a completely empty row.
     pub(crate) end_at_empty_row: bool,
+
+    /// Spread data from merged cells across all cells in the merged range.
+    pub(crate) spread_merged_cells: bool,
 }
 
 impl Criteria {

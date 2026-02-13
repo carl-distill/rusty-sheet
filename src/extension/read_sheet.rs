@@ -3,6 +3,7 @@ use crate::database::column::Column;
 use crate::database::column::ColumnType;
 use crate::error::ResultMessage;
 use crate::error::RustySheetError;
+use crate::extension::SpreadMergedCellsParam;
 use crate::extension::writer::write_to_vector;
 use crate::extension::AnalyzeRowsParam;
 use crate::extension::ColumnsParam;
@@ -62,6 +63,8 @@ struct ReadSheetParameters {
     file_name_column: Option<String>,
     /// column name for sheet name of record
     sheet_name_column: Option<String>,
+    /// Whether to spread merged cells across merged ranges (default: false)
+    spread_merged_cells: Option<bool>,
 }
 
 impl TryFrom<&BindInfo> for ReadSheetParameters {
@@ -83,6 +86,7 @@ impl TryFrom<&BindInfo> for ReadSheetParameters {
             end_at_empty_row: EndAtEmptyRowParam::read(bind)?,
             file_name_column: FileNameColumnParam::read(bind)?,
             sheet_name_column: SheetNameColumnParam::read(bind)?,
+            spread_merged_cells: SpreadMergedCellsParam::read(bind)?,
         })
     }
 }
@@ -101,6 +105,8 @@ pub(crate) struct ReadSheetBindData {
     sheets: Vec<Sheet>,
     /// Shared string table for efficient string storage (XLSX/XLSB format)
     shared_strings: Vec<Option<String>>,
+    /// Whether to spread merged cells across merged ranges (default: false)
+    spread_merged_cells: bool,
 }
 
 impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
@@ -122,7 +128,7 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
         let error_as_null = parameters.error_as_null.unwrap_or(false);
         let skip_empty_rows = parameters.skip_empty_rows.unwrap_or(false);
         let end_at_empty_row = parameters.end_at_empty_row.unwrap_or(false);
-
+        let spread_merged_cells = parameters.spread_merged_cells.unwrap_or(false);
         // Analyze the sheet structure to determine column types and bounds
         let tables = spreadsheet.analyze_sheets(header, &Criteria {
             sheet_name_patterns: sheet_name_pattern.to_owned(),
@@ -133,6 +139,7 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
             error_as_null,
             skip_empty_rows,
             end_at_empty_row,
+            spread_merged_cells,
         }, parameters.columns.as_ref().unwrap_or(&vec![]))?;
 
         // Extract the first matching sheet or return error if no match found
@@ -171,6 +178,7 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
             error_as_null,
             skip_empty_rows,
             end_at_empty_row,
+            spread_merged_cells,
         })?;
 
         let shared_strings = shared_strings
@@ -189,6 +197,7 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
             sheet_name_column,
             sheets,
             shared_strings,
+            spread_merged_cells,
         })
     }
 }
@@ -303,6 +312,7 @@ impl VTab for ReadSheetTableFunction {
             ErrorAsNullParam::definition(),
             SkipEmptyRowsParam::definition(),
             EndAtEmptyRowParam::definition(),
+            SpreadMergedCellsParam::definition(),
             FileNameColumnParam::definition(),
             SheetNameColumnParam::definition(),
         ])
