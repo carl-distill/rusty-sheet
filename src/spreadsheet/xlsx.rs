@@ -6,8 +6,10 @@ use crate::helpers::xml::XmlReader;
 use crate::helpers::xml::XmlTextContextHelper;
 use crate::helpers::zip::ZipHelper;
 use crate::match_xml_events;
+use crate::spreadsheet::SheetBatch;
 use crate::spreadsheet::Spreadsheet;
 use crate::spreadsheet::SpreadsheetError;
+use crate::spreadsheet::stream_materialized_sheets;
 use crate::spreadsheet::cell::Cell;
 use crate::spreadsheet::cell::CellType;
 use crate::spreadsheet::criteria::Criteria;
@@ -22,7 +24,14 @@ use quick_xml::name::QName;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs::File;
 use std::io::BufReader;
+use std::io::ErrorKind;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
+use std::sync::Arc;
 use zip::ZipArchive;
 use zip::read::ZipFile;
 
@@ -55,6 +64,67 @@ pub(crate) struct XlsxSpreadsheet {
     sheets: Vec<(String, String)>,
 }
 
+struct SharedStringStore {
+    index: File,
+    values: File,
+}
+
+impl SharedStringStore {
+    const RECORD_SIZE: u64 = 16;
+    const NULL_OFFSET: u64 = u64::MAX;
+
+    fn load(
+        zip: &mut ZipArchive<UnifiedReader>,
+        nulls: &HashSet<String>,
+    ) -> Result<Self, RustySheetError> {
+        let mut index = tempfile::tempfile()?;
+        let mut values = tempfile::tempfile()?;
+        let Some(mut reader) = zip.xml_reader("xl/sharedStrings.xml")? else {
+            return Ok(Self { index, values });
+        };
+
+        match_xml_events!(reader => {
+            Event::Start(event) if event.name() == TAG_SHARED_STRING_ITEM => {
+                let value = read_string_value(&mut reader, TAG_SHARED_STRING_ITEM, false)?;
+                let (offset, length) = if nulls.contains(&value) {
+                    (Self::NULL_OFFSET, 0)
+                } else {
+                    let offset = values.stream_position()?;
+                    values.write_all(value.as_bytes())?;
+                    (offset, value.len() as u64)
+                };
+                index.write_all(&offset.to_le_bytes())?;
+                index.write_all(&length.to_le_bytes())?;
+            }
+        });
+
+        Ok(Self { index, values })
+    }
+
+    fn get(&mut self, id: usize) -> Result<Option<String>, RustySheetError> {
+        let record_offset = (id as u64)
+            .checked_mul(Self::RECORD_SIZE)
+            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "shared string index overflow"))?;
+        self.index.seek(SeekFrom::Start(record_offset))?;
+        let mut record = [0_u8; Self::RECORD_SIZE as usize];
+        self.index.read_exact(&mut record)?;
+
+        let offset = u64::from_le_bytes(record[..8].try_into().expect("shared string offset"));
+        if offset == Self::NULL_OFFSET {
+            return Ok(None);
+        }
+        let length = u64::from_le_bytes(record[8..].try_into().expect("shared string length"));
+        let length = usize::try_from(length)
+            .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "shared string is too large"))?;
+        let mut bytes = vec![0_u8; length];
+        self.values.seek(SeekFrom::Start(offset))?;
+        self.values.read_exact(&mut bytes)?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error).into())
+    }
+}
+
 impl XlsxSpreadsheet {
     /// Opens an XLSX spreadsheet file and parses its structure
     ///
@@ -71,6 +141,153 @@ impl XlsxSpreadsheet {
             number_formats,
             sheets,
         })
+    }
+
+    fn stream_xlsx_sheets(
+        &mut self,
+        criteria: &Criteria,
+        consumer: &mut dyn FnMut(SheetBatch) -> bool,
+    ) -> Result<(), RustySheetError> {
+        let mut shared_strings = SharedStringStore::load(&mut self.zip, &criteria.nulls)?;
+        let empty_shared_strings = Arc::new(Vec::new());
+        let mut sheet_count = 0_usize;
+
+        for (sheet_name, zip_path) in &self.sheets {
+            if criteria
+                .sheet_limit
+                .map(|limit| sheet_count >= limit)
+                .unwrap_or(false)
+            {
+                break;
+            } else if criteria.accept(sheet_name) {
+                sheet_count += 1;
+            } else {
+                continue;
+            }
+
+            let mut sheet = Sheet::new(
+                &self.name,
+                sheet_name,
+                criteria.range,
+                criteria.rows_limit,
+                criteria.skip_empty_rows,
+            );
+            let mut last_row = sheet.chunk_row_lower;
+            let mut has_data = false;
+            let mut row_count = 0_usize;
+            let mut col_count = 0_usize;
+            let mut row = 0_usize;
+            let mut col = 0_usize;
+            let mut kind = CellType::default();
+            let mut value = String::new();
+            let mut reader = self.zip.xml_reader(zip_path)?.expect(sheet_name);
+
+            match_xml_events!(reader => {
+                Event::End(event) if event.name() == TAG_ROW => {
+                    row_count += 1;
+                    col_count = 0;
+                }
+                Event::Start(event) if event.name() == TAG_CELL => {
+                    (row, col) = event.get_attribute_value("r")?
+                        .and_then(|reference| reference_to_index(&reference))
+                        .unwrap_or((row_count, col_count));
+                    col_count += 1;
+                    if sheet.after_row_upper_bound(row) {
+                        break;
+                    }
+                    if sheet.contains(row, col) {
+                        kind = event.get_attribute_value("t")?.map(|value| {
+                            match value.as_ref() {
+                                "inlineStr" | "str" => CellType::InlineString,
+                                "s" => CellType::SharedString,
+                                "d" => CellType::IsoDateTime,
+                                "b" => CellType::Boolean,
+                                "e" => if criteria.error_as_null { CellType::Empty } else { CellType::Error },
+                                _ => CellType::Number,
+                            }
+                        }).unwrap_or(CellType::Number);
+                        if let Some(format_id) = event.get_attribute_value("s")? {
+                            if kind == CellType::Number && !format_id.is_empty() {
+                                kind = self.number_formats[format_id.parse::<usize>()?];
+                            }
+                        }
+                    } else {
+                        kind = CellType::default();
+                    }
+                }
+                Event::Start(event) if kind != CellType::Empty && event.name() == TAG_INLINE_STRING => {
+                    value = read_string_value(&mut reader, TAG_INLINE_STRING, false)?;
+                }
+                Event::Start(event) if kind != CellType::Empty && event.name() == TAG_VALUE => {
+                    value = read_string_value(&mut reader, TAG_VALUE, true)?;
+                }
+                Event::End(event) if kind != CellType::Empty && event.name() == TAG_CELL => {
+                    if kind == CellType::Error {
+                        let reference = index_to_reference(row, col);
+                        Err(SpreadsheetError::CellValueError(
+                            sheet.file_name.clone(),
+                            sheet.name.clone(),
+                            reference,
+                            value.clone(),
+                        ))?
+                    }
+
+                    let (kind, resolved_value) = if kind == CellType::SharedString {
+                        (
+                            CellType::InlineString,
+                            shared_strings.get(value.parse::<usize>()?)?,
+                        )
+                    } else if criteria.nulls.contains(&value) {
+                        (kind, None)
+                    } else {
+                        (kind, Some(value.clone()))
+                    };
+
+                    if let Some(resolved_value) = resolved_value {
+                        if let Some(last_row) = last_row {
+                            if criteria.end_at_empty_row
+                                && ((!has_data && last_row != row)
+                                    || (has_data && last_row + 1 < row))
+                            {
+                                break;
+                            }
+                        }
+                        last_row = Some(row);
+                        has_data = true;
+                        sheet.push(Cell {
+                            row,
+                            col,
+                            kind,
+                            value: resolved_value,
+                        });
+                        while let Some(chunk) = sheet.take_ready_chunk() {
+                            if !consumer(SheetBatch {
+                                sheet: chunk,
+                                shared_strings: Arc::clone(&empty_shared_strings),
+                            }) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    value.clear();
+                }
+                Event::End(event) if event.name() == TAG_CELL => {
+                    value.clear();
+                },
+            });
+
+            sheet.finish(criteria.end_at_empty_row);
+            while let Some(chunk) = sheet.take_ready_chunk() {
+                if !consumer(SheetBatch {
+                    sheet: chunk,
+                    shared_strings: Arc::clone(&empty_shared_strings),
+                }) {
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -368,6 +585,25 @@ impl Spreadsheet for XlsxSpreadsheet {
         }
 
         Ok(sheets)
+    }
+
+    fn stream_sheets(
+        &mut self,
+        criteria: &Criteria,
+        consumer: &mut dyn FnMut(SheetBatch) -> bool,
+    ) -> Result<(), RustySheetError> {
+        if criteria.spread_merged_cells {
+            let shared_strings = Arc::new(
+                self.load_shared_strings(None)?
+                    .0
+                    .into_iter()
+                    .map(|value| (!criteria.nulls.contains(&value)).then_some(value))
+                    .collect(),
+            );
+            stream_materialized_sheets(self.read_sheets(criteria)?, shared_strings, consumer);
+            return Ok(());
+        }
+        self.stream_xlsx_sheets(criteria, consumer)
     }
 }
 

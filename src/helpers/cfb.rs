@@ -61,17 +61,22 @@ pub(crate) struct Cfb {
 impl Cfb {
     /// Creates a new CFB structure by reading and parsing the entire file
     pub(crate) fn new<RS: Read + Seek>(reader: &mut RS) -> Result<Cfb, RustySheetError> {
-        // Load the entire CFB content into memory
         let size = reader.seek(SeekFrom::End(0))?;
         if size < 512 {
             Err(CfbError::FileFormatError)?;
         }
         reader.seek(SeekFrom::Start(0))?;
+        let mut header_bytes = [0u8; 512];
+        reader.read_exact(&mut header_bytes)?;
+        let header = Header::new(&header_bytes)?;
+        let sector_size = header.sector_size()?;
+
+        // Load the complete file only after its header identifies it as CFB.
         let mut data: Vec<u8> = vec![0u8; size as usize];
-        reader.read_exact(&mut data)?;
+        data[..512].copy_from_slice(&header_bytes);
+        reader.read_exact(&mut data[512..])?;
         // Parse the data
-        let header = Header::new(&data[..512])?;
-        let sectors = Sectors { data, size: header.sector_size()? };
+        let sectors = Sectors { data, size: sector_size };
         let file_allocation_table = Self::load_file_allocation_table(&sectors, &header)?;
         let directories = Self::load_directories(&file_allocation_table, &sectors, header.directory_shift)?;
         let mini_file_allocation_table = Self::load_mini_file_allocation_table(&file_allocation_table, &sectors, &header)?;
@@ -274,5 +279,19 @@ impl Directory {
         let index = to_usize(&bytes[116..120]);
         let count = to_u64(&bytes[120..128]) as usize;
         (name, Directory { index, count })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn non_cfb_input_stops_after_header() {
+        let mut reader = Cursor::new(vec![0_u8; 4096]);
+
+        assert!(Cfb::new(&mut reader).is_err());
+        assert_eq!(reader.stream_position().unwrap(), 512);
     }
 }

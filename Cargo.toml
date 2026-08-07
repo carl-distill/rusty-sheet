@@ -32,5 +32,6 @@ libduckdb-sys = { version = "1.4.3", features = ["loadable-extension"] }
 quick-xml = "0.38.4"
 regex = "1.12.2"
 thiserror = "2.0.17"
+tempfile = "3.23.0"
 url = "2.5.7"
 zip = { version = "6.0.0", features = ["deflate"] }

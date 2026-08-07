@@ -15,6 +15,7 @@ use glob::Pattern;
 use sheet::Sheet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use thiserror::Error;
 
 pub(crate) mod cell;
@@ -154,6 +155,29 @@ pub(crate) enum SpreadsheetError {
     /// Error indicating a worksheet cell reference is outside the supported spreadsheet bounds.
     #[error("Sheet '[{0}]{1}': invalid cell reference '{2}'")]
     CellReferenceError(String, String, String),
+}
+
+pub(crate) struct SheetBatch {
+    pub(crate) sheet: Sheet,
+    pub(crate) shared_strings: Arc<Vec<Option<String>>>,
+}
+
+pub(crate) fn stream_materialized_sheets(
+    sheets: Vec<Sheet>,
+    shared_strings: Arc<Vec<Option<String>>>,
+    consumer: &mut dyn FnMut(SheetBatch) -> bool,
+) -> bool {
+    for mut sheet in sheets {
+        while let Some(sheet) = sheet.take_ready_chunk() {
+            if !consumer(SheetBatch {
+                sheet,
+                shared_strings: Arc::clone(&shared_strings),
+            }) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(crate) trait Spreadsheet {
@@ -305,6 +329,24 @@ pub(crate) trait Spreadsheet {
         &mut self,
         criteria: &Criteria,
     ) -> Result<Vec<Sheet>, RustySheetError>;
+
+    /// Sends sheets to the consumer as they become available. Formats can
+    /// override this to avoid materializing the complete sheet in memory.
+    fn stream_sheets(
+        &mut self,
+        criteria: &Criteria,
+        consumer: &mut dyn FnMut(SheetBatch) -> bool,
+    ) -> Result<(), RustySheetError> {
+        let shared_strings = Arc::new(
+            self.load_shared_strings(None)?
+                .0
+                .into_iter()
+                .map(|value| (!criteria.nulls.contains(&value)).then_some(value))
+                .collect(),
+        );
+        stream_materialized_sheets(self.read_sheets(criteria)?, shared_strings, consumer);
+        Ok(())
+    }
 }
 
 /// Opens a spreadsheet file based on its format
@@ -352,4 +394,38 @@ pub(crate) fn open_spreadsheets(files: &Vec<String>, patterns: &Option<Vec<(Opti
         (spreadsheet, sheet_name_patterns)
     }).collect::<Vec<_>>();
     Ok(spreadsheets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spreadsheet::cell::{Cell, CellType};
+
+    #[test]
+    fn materialized_stream_emits_every_chunk() {
+        let mut sheet = Sheet::new("file.xlsx", "Sheet1", None, None, false);
+        for row in 0..2049 {
+            sheet.push(Cell {
+                row,
+                col: 0,
+                kind: CellType::Number,
+                value: row.to_string(),
+            });
+        }
+        sheet.finish(false);
+
+        let mut batches = 0;
+        let mut rows = 0;
+        assert!(stream_materialized_sheets(
+            vec![sheet],
+            Arc::new(Vec::new()),
+            &mut |batch| {
+                batches += 1;
+                rows += batch.sheet.chunk(0).expect("batch table").len();
+                true
+            },
+        ));
+        assert_eq!(batches, 2);
+        assert_eq!(rows, 2049);
+    }
 }

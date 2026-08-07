@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use crate::database::column::Column;
 use crate::database::column::ColumnType;
 use crate::error::ResultMessage;
@@ -23,7 +22,7 @@ use crate::extension::SheetParam;
 use crate::extension::SkipEmptyRowsParam;
 use crate::spreadsheet::criteria::Criteria;
 use crate::spreadsheet::open_spreadsheet;
-use crate::spreadsheet::sheet::Sheet;
+use crate::spreadsheet::SheetBatch;
 use anyhow::Result;
 use duckdb::core::DataChunkHandle;
 use duckdb::core::Inserter;
@@ -33,9 +32,11 @@ use duckdb::vtab::InitInfo;
 use duckdb::vtab::TableFunctionInfo;
 use duckdb::vtab::VTab;
 use glob::Pattern;
+use std::collections::HashSet;
 use std::error::Error;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::Receiver;
+use std::sync::Mutex;
 
 /// Parameters for reading a single sheet from a spreadsheet file.
 struct ReadSheetParameters {
@@ -101,12 +102,10 @@ pub(crate) struct ReadSheetBindData {
     file_name_column: Option<usize>,
     /// sheet name column index
     sheet_name_column: Option<usize>,
-    /// Loaded sheet data organized in chunks for efficient processing
-    sheets: Vec<Sheet>,
-    /// Shared string table for efficient string storage (XLSX/XLSB format)
-    shared_strings: Vec<Option<String>>,
-    /// Whether to spread merged cells across merged ranges (default: false)
-    spread_merged_cells: bool,
+    /// Spreadsheet path reopened by the scan worker after binding.
+    file_name: String,
+    /// Criteria for the full scan after the bounded schema sample.
+    criteria: Criteria,
 }
 
 impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
@@ -118,9 +117,8 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
         // Prepare sheet name pattern for matching
         let sheet_name_pattern = parameters.sheet_name.as_ref().map(|pattern| vec![pattern.to_owned()]);
 
-        // Open the spreadsheet file and load shared strings (for XLSX/XLSB formats)
+        // Open the spreadsheet file for the bounded schema sample.
         let mut spreadsheet = open_spreadsheet(&parameters.file_name)?;
-        let (shared_strings, _) = spreadsheet.load_shared_strings(None)?;
 
         // Set default values for optional parameters
         let header = parameters.header.unwrap_or(true);
@@ -143,7 +141,7 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
         }, parameters.columns.as_ref().unwrap_or(&vec![]))?;
 
         // Extract the first matching sheet or return error if no match found
-        let table = tables.get(0).ok_or_else(|| ExtensionError::SheetWildcardError(
+        let table = tables.first().ok_or_else(|| ExtensionError::SheetWildcardError(
             spreadsheet.name().to_owned(),
             parameters.sheet_name.as_ref().map(|it| it.to_string()).unwrap_or(String::new()),
         ))?;
@@ -163,8 +161,7 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
             });
         }
 
-        // Read the actual data from the spreadsheet using the analyzed structure
-        let sheets = spreadsheet.read_sheets(&Criteria {
+        let criteria = Criteria {
             sheet_name_patterns: sheet_name_pattern.to_owned(),
             sheet_limit: Some(1),
             range: Some(Range {
@@ -179,25 +176,13 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
             skip_empty_rows,
             end_at_empty_row,
             spread_merged_cells,
-        })?;
-
-        let shared_strings = shared_strings
-            .into_iter()
-            .map(|shared_string| {
-                if !nulls.contains(&shared_string) {
-                    Some(shared_string)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        };
         Ok(ReadSheetBindData {
             columns,
             file_name_column,
             sheet_name_column,
-            sheets,
-            shared_strings,
-            spread_merged_cells,
+            file_name: parameters.file_name.clone(),
+            criteria,
         })
     }
 }
@@ -206,8 +191,8 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
 /// Initialization data for the table function execution phase.
 /// This tracks the current processing state and column projections.
 pub(crate) struct ReadSheetInitData {
-    /// Atomic counter tracking the current chunk being processed
-    index: AtomicUsize,
+    /// Bounded queue fed by the spreadsheet parser.
+    receiver: Mutex<Receiver<Result<SheetBatch, String>>>,
     /// Column indices that should be projected (output) from the source data
     projections: Vec<usize>,
 }
@@ -235,12 +220,25 @@ impl VTab for ReadSheetTableFunction {
     /// Initializes the table function for execution.
     /// This sets up the processing state and column projections for the current query.
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
+        let bind: *const Self::BindData = init.get_bind_data();
+        let (file_name, criteria) = unsafe {
+            ((*bind).file_name.clone(), (*bind).criteria.clone())
+        };
         let projections = init.get_column_indices()
             .into_iter()
             .map(|index| index as usize)
             .collect::<Vec<_>>();
+        let (sender, receiver) = sync_channel(2);
+        std::thread::spawn(move || {
+            let result = open_spreadsheet(&file_name).and_then(|mut spreadsheet| {
+                spreadsheet.stream_sheets(&criteria, &mut |batch| sender.send(Ok(batch)).is_ok())
+            });
+            if let Err(error) = result {
+                let _ = sender.send(Err(error.to_string()));
+            }
+        });
         Ok(ReadSheetInitData {
-            index: AtomicUsize::new(0),
+            receiver: Mutex::new(receiver),
             projections,
         })
     }
@@ -253,33 +251,38 @@ impl VTab for ReadSheetTableFunction {
     ) -> Result<(), Box<dyn Error>> {
         let bind = func.get_bind_data();
         let init = func.get_init_data();
-        let sheet = &bind.sheets[0];
-        let shared_strings = &bind.shared_strings;
-        let index = init.index.fetch_add(1, Ordering::Relaxed);
-        if index < sheet.chunks.len() {
-            let mut vectors: Vec<_> = (0..init.projections.len()).map(|index| output.flat_vector(index)).collect();
-            if let Some(table) = sheet.chunk(index) {
-                output.set_len(table.len());
-                for (row, record) in table.iter().enumerate() {
-                    for (index, col) in init.projections.iter().enumerate() {
-                        let vector = &mut vectors[index];
-                        if bind.file_name_column.map(|column| column == *col).unwrap_or(false) {
-                            vector.insert(row, sheet.file_name.as_str());
-                        } else if bind.sheet_name_column.map(|column| column == *col).unwrap_or(false) {
-                            vector.insert(row, sheet.name.as_str());
-                        } else if let Some(cell) = record[*col] {
-                            let column = &bind.columns[*col];
-                            write_to_vector(sheet, column, cell, vector, row, shared_strings)?;
-                        } else {
-                            vector.set_null(row);
-                        }
+        let batch = init.receiver
+            .lock()
+            .map_err(|_| std::io::Error::other("spreadsheet stream lock poisoned"))?
+            .recv();
+        let batch = match batch {
+            Ok(Ok(batch)) => batch,
+            Ok(Err(error)) => return Err(std::io::Error::other(error).into()),
+            Err(_) => {
+                output.set_len(0);
+                return Ok(());
+            }
+        };
+        let sheet = &batch.sheet;
+        let mut vectors: Vec<_> = (0..init.projections.len()).map(|index| output.flat_vector(index)).collect();
+        if let Some(table) = sheet.chunk(0) {
+            output.set_len(table.len());
+            for (row, record) in table.iter().enumerate() {
+                for (index, col) in init.projections.iter().enumerate() {
+                    let vector = &mut vectors[index];
+                    if bind.file_name_column.map(|column| column == *col).unwrap_or(false) {
+                        vector.insert(row, sheet.file_name.as_str());
+                    } else if bind.sheet_name_column.map(|column| column == *col).unwrap_or(false) {
+                        vector.insert(row, sheet.name.as_str());
+                    } else if let Some(cell) = record[*col] {
+                        let column = &bind.columns[*col];
+                        write_to_vector(sheet, column, cell, vector, row, batch.shared_strings.as_ref())?;
+                    } else {
+                        vector.set_null(row);
                     }
                 }
-            } else {
-                output.set_len(0);
             }
         } else {
-            // No more data to process
             output.set_len(0);
         }
         Ok(())
