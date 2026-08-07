@@ -19,18 +19,13 @@ use crate::spreadsheet::reference::index_to_reference;
 use crate::spreadsheet::reference::reference_to_index;
 use crate::spreadsheet::resolve_number_format;
 use crate::spreadsheet::sheet::Sheet;
+use crate::spreadsheet::shared_strings::SharedStringStore;
 use quick_xml::events::Event;
 use quick_xml::name::QName;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs::File;
 use std::io::BufReader;
-use std::io::ErrorKind;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::io::Write;
 use std::sync::Arc;
 use zip::ZipArchive;
 use zip::read::ZipFile;
@@ -64,67 +59,6 @@ pub(crate) struct XlsxSpreadsheet {
     sheets: Vec<(String, String)>,
 }
 
-struct SharedStringStore {
-    index: File,
-    values: File,
-}
-
-impl SharedStringStore {
-    const RECORD_SIZE: u64 = 16;
-    const NULL_OFFSET: u64 = u64::MAX;
-
-    fn load(
-        zip: &mut ZipArchive<UnifiedReader>,
-        nulls: &HashSet<String>,
-    ) -> Result<Self, RustySheetError> {
-        let mut index = tempfile::tempfile()?;
-        let mut values = tempfile::tempfile()?;
-        let Some(mut reader) = zip.xml_reader("xl/sharedStrings.xml")? else {
-            return Ok(Self { index, values });
-        };
-
-        match_xml_events!(reader => {
-            Event::Start(event) if event.name() == TAG_SHARED_STRING_ITEM => {
-                let value = read_string_value(&mut reader, TAG_SHARED_STRING_ITEM, false)?;
-                let (offset, length) = if nulls.contains(&value) {
-                    (Self::NULL_OFFSET, 0)
-                } else {
-                    let offset = values.stream_position()?;
-                    values.write_all(value.as_bytes())?;
-                    (offset, value.len() as u64)
-                };
-                index.write_all(&offset.to_le_bytes())?;
-                index.write_all(&length.to_le_bytes())?;
-            }
-        });
-
-        Ok(Self { index, values })
-    }
-
-    fn get(&mut self, id: usize) -> Result<Option<String>, RustySheetError> {
-        let record_offset = (id as u64)
-            .checked_mul(Self::RECORD_SIZE)
-            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "shared string index overflow"))?;
-        self.index.seek(SeekFrom::Start(record_offset))?;
-        let mut record = [0_u8; Self::RECORD_SIZE as usize];
-        self.index.read_exact(&mut record)?;
-
-        let offset = u64::from_le_bytes(record[..8].try_into().expect("shared string offset"));
-        if offset == Self::NULL_OFFSET {
-            return Ok(None);
-        }
-        let length = u64::from_le_bytes(record[8..].try_into().expect("shared string length"));
-        let length = usize::try_from(length)
-            .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "shared string is too large"))?;
-        let mut bytes = vec![0_u8; length];
-        self.values.seek(SeekFrom::Start(offset))?;
-        self.values.read_exact(&mut bytes)?;
-        String::from_utf8(bytes)
-            .map(Some)
-            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error).into())
-    }
-}
-
 impl XlsxSpreadsheet {
     /// Opens an XLSX spreadsheet file and parses its structure
     ///
@@ -143,12 +77,26 @@ impl XlsxSpreadsheet {
         })
     }
 
+    fn load_shared_string_store(&mut self) -> Result<SharedStringStore, RustySheetError> {
+        let mut store = SharedStringStore::new()?;
+        let Some(mut reader) = self.zip.xml_reader("xl/sharedStrings.xml")? else {
+            return Ok(store);
+        };
+        match_xml_events!(reader => {
+            Event::Start(event) if event.name() == TAG_SHARED_STRING_ITEM => {
+                let value = read_string_value(&mut reader, TAG_SHARED_STRING_ITEM, false)?;
+                store.push(&value)?;
+            }
+        });
+        Ok(store)
+    }
+
     fn stream_xlsx_sheets(
         &mut self,
         criteria: &Criteria,
         consumer: &mut dyn FnMut(SheetBatch) -> bool,
     ) -> Result<(), RustySheetError> {
-        let mut shared_strings = SharedStringStore::load(&mut self.zip, &criteria.nulls)?;
+        let mut shared_strings = self.load_shared_string_store()?;
         let empty_shared_strings = Arc::new(Vec::new());
         let mut sheet_count = 0_usize;
 
@@ -233,10 +181,8 @@ impl XlsxSpreadsheet {
                     }
 
                     let (kind, resolved_value) = if kind == CellType::SharedString {
-                        (
-                            CellType::InlineString,
-                            shared_strings.get(value.parse::<usize>()?)?,
-                        )
+                        let value = shared_strings.get(value.parse::<usize>()?)?;
+                        (CellType::InlineString, (!criteria.nulls.contains(&value)).then_some(value))
                     } else if criteria.nulls.contains(&value) {
                         (kind, None)
                     } else {

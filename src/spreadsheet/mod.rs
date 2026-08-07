@@ -27,6 +27,7 @@ pub(crate) mod xlsb;
 pub(crate) mod xlsx;
 pub(crate) mod criteria;
 pub(crate) mod sheet;
+pub(crate) mod shared_strings;
 
 pub(crate) fn resolve_number_format(
     number_formats: &[CellType],
