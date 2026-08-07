@@ -32,11 +32,15 @@ use duckdb::vtab::InitInfo;
 use duckdb::vtab::TableFunctionInfo;
 use duckdb::vtab::VTab;
 use glob::Pattern;
+use std::any::Any;
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::mpsc::sync_channel;
 use std::sync::mpsc::Receiver;
+use std::sync::mpsc::SyncSender;
 use std::sync::Mutex;
+
+type StreamResult = Result<SheetBatch, String>;
 
 /// Parameters for reading a single sheet from a spreadsheet file.
 struct ReadSheetParameters {
@@ -192,9 +196,38 @@ impl TryFrom<&ReadSheetParameters> for ReadSheetBindData {
 /// This tracks the current processing state and column projections.
 pub(crate) struct ReadSheetInitData {
     /// Bounded queue fed by the spreadsheet parser.
-    receiver: Mutex<Receiver<Result<SheetBatch, String>>>,
+    receiver: Mutex<Receiver<StreamResult>>,
     /// Column indices that should be projected (output) from the source data
     projections: Vec<usize>,
+}
+
+fn run_stream_worker<F>(sender: SyncSender<StreamResult>, stream: F)
+where
+    F: FnOnce(&SyncSender<StreamResult>) -> Result<(), RustySheetError>,
+{
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stream(&sender)));
+    match result {
+        Ok(Ok(())) => (),
+        Ok(Err(error)) => {
+            let _ = sender.send(Err(error.to_string()));
+        }
+        Err(payload) => {
+            let _ = sender.send(Err(format!(
+                "spreadsheet stream panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )));
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// Main table function implementation for reading single sheets from spreadsheets.
@@ -230,12 +263,11 @@ impl VTab for ReadSheetTableFunction {
             .collect::<Vec<_>>();
         let (sender, receiver) = sync_channel(2);
         std::thread::spawn(move || {
-            let result = open_spreadsheet(&file_name).and_then(|mut spreadsheet| {
-                spreadsheet.stream_sheets(&criteria, &mut |batch| sender.send(Ok(batch)).is_ok())
+            run_stream_worker(sender, |sender| {
+                open_spreadsheet(&file_name).and_then(|mut spreadsheet| {
+                    spreadsheet.stream_sheets(&criteria, &mut |batch| sender.send(Ok(batch)).is_ok())
+                })
             });
-            if let Err(error) = result {
-                let _ = sender.send(Err(error.to_string()));
-            }
         });
         Ok(ReadSheetInitData {
             receiver: Mutex::new(receiver),
@@ -319,5 +351,37 @@ impl VTab for ReadSheetTableFunction {
             FileNameColumnParam::definition(),
             SheetNameColumnParam::definition(),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_worker_sends_parser_errors() {
+        let (sender, receiver) = sync_channel(1);
+
+        run_stream_worker(sender, |_| {
+            Err(RustySheetError::WithContextError("bad workbook".to_string()))
+        });
+
+        assert_eq!(receive_error(receiver), "bad workbook");
+    }
+
+    #[test]
+    fn stream_worker_sends_panic_errors() {
+        let (sender, receiver) = sync_channel(1);
+
+        run_stream_worker(sender, |_| panic!("bad workbook"));
+
+        assert_eq!(receive_error(receiver), "spreadsheet stream panicked: bad workbook");
+    }
+
+    fn receive_error(receiver: Receiver<StreamResult>) -> String {
+        match receiver.recv().unwrap() {
+            Ok(_) => panic!("expected stream error"),
+            Err(error) => error,
+        }
     }
 }
