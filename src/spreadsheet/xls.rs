@@ -311,7 +311,13 @@ impl Spreadsheet for XlsSpreadsheet {
         &mut self,
         indexes: Option<HashSet<usize>>,
     ) -> Result<(Vec<String>, HashMap<usize, usize>), RustySheetError> {
-        let indexes = indexes.unwrap_or_else(|| (0..self.shared_strings.len()).collect());
+        let Some(indexes) = indexes else {
+            let mut shared_strings = Vec::with_capacity(self.shared_strings.len());
+            for id in 0..self.shared_strings.len() {
+                shared_strings.push(self.shared_strings.get(id)?);
+            }
+            return Ok((shared_strings, HashMap::new()));
+        };
         let mut shared_strings = Vec::with_capacity(indexes.len());
         let mut mappings = HashMap::<usize, usize>::new();
         for id in indexes {
@@ -608,5 +614,32 @@ fn read_formula_cell(
         Ok((Either::Left(CellType::InlineString), "".to_owned()))
     } else {
         Err(XlsError::FormulaValueError(formula))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_all_shared_strings_preserves_index_order() {
+        let file = tempfile::tempfile().unwrap();
+        let reader = Biff8Reader::new(file, 0).unwrap();
+        let mut shared_strings = SharedStringStore::new().unwrap();
+        shared_strings.push("alpha").unwrap();
+        shared_strings.push("bravo").unwrap();
+        shared_strings.push("charlie").unwrap();
+        let mut spreadsheet = XlsSpreadsheet {
+            name: String::new(),
+            reader,
+            shared_strings,
+            number_formats: Vec::new(),
+            sheets: Vec::new(),
+        };
+
+        let (values, mappings) = spreadsheet.load_shared_strings(None).unwrap();
+
+        assert_eq!(values, ["alpha", "bravo", "charlie"]);
+        assert!(mappings.is_empty());
     }
 }
