@@ -230,7 +230,14 @@ pub(crate) trait Spreadsheet {
                                 cell,
                             )?.to_owned()
                         } else {
-                            cell.to_string()
+                            cell.to_display_string().map_err(|message| {
+                                SpreadsheetError::CellValueError(
+                                    file_name.to_owned(),
+                                    sheet_name.to_owned(),
+                                    cell.reference(),
+                                    message,
+                                )
+                            })?
                         };
                         Ok(if !criteria.nulls.contains(&value) {
                             value

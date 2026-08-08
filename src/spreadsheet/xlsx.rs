@@ -602,6 +602,23 @@ mod tests {
         assert!(error.contains("invalid cell reference 'XFE1'"));
     }
 
+    #[test]
+    fn invalid_date_header_value_returns_error() {
+        let path = invalid_workbook_path("date-header");
+        write_invalid_date_header_workbook(&path);
+
+        let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
+        let result = spreadsheet.analyze_sheets(true, &default_criteria(), &Vec::new());
+
+        std::fs::remove_file(path).unwrap();
+        let error = match result {
+            Ok(_) => panic!("expected invalid date header value error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Sheet1!A1"));
+        assert!(error.contains("parse 'not-a-number' to Date(1900) failed"));
+    }
+
     fn invalid_workbook_path(kind: &str) -> PathBuf {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -792,6 +809,67 @@ mod tests {
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData><row r="1"><c r="XFE1" t="inlineStr"><is><t>value</t></is></c></row></sheetData>
+</worksheet>"#.to_string(),
+            ),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn write_invalid_date_header_workbook(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+        for (name, content) in [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>"#.to_string(),
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#.to_string(),
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#.to_string(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#.to_string(),
+            ),
+            (
+                "xl/styles.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <cellXfs count="1"><xf numFmtId="14"/></cellXfs>
+</styleSheet>"#.to_string(),
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" s="0"><v>not-a-number</v></c></row></sheetData>
 </worksheet>"#.to_string(),
             ),
         ] {

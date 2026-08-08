@@ -43,7 +43,7 @@ pub(super) fn write_to_vector(sheet: &Sheet, column: &Column, cell: &Cell, vecto
         cell
     };
     match column.kind {
-        ColumnType::Varchar => vector.insert(row, &cell.to_string()),
+        ColumnType::Varchar => vector.insert(row, &cell.to_display_string().map_err(mapper)?),
         ColumnType::Boolean => write_primitive(vector, row, cell.to_boolean()),
         ColumnType::BigInt => write_primitive(vector, row, cell.to_bigint().map_err(mapper)?),
         ColumnType::Double => write_primitive(vector, row, cell.to_double().map_err(mapper)?),
