@@ -136,9 +136,17 @@ impl XlsxSpreadsheet {
                     col_count = 0;
                 }
                 Event::Start(event) if event.name() == TAG_CELL => {
-                    (row, col) = event.get_attribute_value("r")?
-                        .and_then(|reference| reference_to_index(&reference))
-                        .unwrap_or((row_count, col_count));
+                    if let Some(reference) = event.get_attribute_value("r")? {
+                        (row, col) = reference_to_index(&reference).ok_or_else(|| {
+                            SpreadsheetError::CellReferenceError(
+                                sheet.file_name.to_owned(),
+                                sheet.name.to_owned(),
+                                reference.to_string(),
+                            )
+                        })?;
+                    } else {
+                        (row, col) = (row_count, col_count);
+                    }
                     col_count += 1;
                     if sheet.after_row_upper_bound(row) {
                         break;
@@ -156,7 +164,15 @@ impl XlsxSpreadsheet {
                         }).unwrap_or(CellType::Number);
                         if let Some(format_id) = event.get_attribute_value("s")? {
                             if kind == CellType::Number && !format_id.is_empty() {
-                                kind = self.number_formats[format_id.parse::<usize>()?];
+                                let index = format_id.parse::<usize>()?;
+                                kind = resolve_number_format(
+                                    &self.number_formats,
+                                    &sheet.file_name,
+                                    &sheet.name,
+                                    row,
+                                    col,
+                                    index,
+                                )?;
                             }
                         }
                     } else {
@@ -759,6 +775,24 @@ mod tests {
     }
 
     #[test]
+    fn stream_invalid_style_index_returns_error() {
+        let path = invalid_workbook_path("stream-style");
+        write_invalid_style_workbook(&path);
+
+        let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
+        let result = spreadsheet.stream_sheets(&default_criteria(), &mut |_| true);
+
+        std::fs::remove_file(path).unwrap();
+        let error = match result {
+            Ok(_) => panic!("expected invalid style index error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Sheet1!A11"));
+        assert!(error.contains("invalid style index 999"));
+        assert!(error.contains("workbook defines 1 styles"));
+    }
+
+    #[test]
     fn invalid_shared_string_index_returns_error() {
         let path = invalid_workbook_path("shared-string");
         write_invalid_shared_string_workbook(&path);
@@ -782,6 +816,23 @@ mod tests {
 
         let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
         let result = spreadsheet.read_sheets(&default_criteria());
+
+        std::fs::remove_file(path).unwrap();
+        let error = match result {
+            Ok(_) => panic!("expected invalid cell reference error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Sheet1"));
+        assert!(error.contains("invalid cell reference 'XFE1'"));
+    }
+
+    #[test]
+    fn stream_invalid_cell_reference_returns_error() {
+        let path = invalid_workbook_path("stream-cell-reference");
+        write_invalid_cell_reference_workbook(&path);
+
+        let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
+        let result = spreadsheet.stream_sheets(&default_criteria(), &mut |_| true);
 
         std::fs::remove_file(path).unwrap();
         let error = match result {

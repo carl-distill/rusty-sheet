@@ -187,7 +187,14 @@ impl XlsSpreadsheet {
                                 }
                                 last_row = Some(row);
                                 let index = self.reader.read_u16()? as usize;
-                                let kind = self.number_formats[index];
+                                let kind = resolve_number_format(
+                                    &self.number_formats,
+                                    &sheet.file_name,
+                                    &sheet.name,
+                                    row,
+                                    col,
+                                    index,
+                                )?;
                                 let value = self.reader.read_rk_number()?;
                                 if !criteria.nulls.contains(&value) {
                                     has_data = true;
@@ -234,7 +241,14 @@ impl XlsSpreadsheet {
                             };
                             let kind = match either {
                                 Either::Left(kind) => kind,
-                                Either::Right(index) => self.number_formats[index],
+                                Either::Right(index) => resolve_number_format(
+                                    &self.number_formats,
+                                    &sheet.file_name,
+                                    &sheet.name,
+                                    row,
+                                    col,
+                                    index,
+                                )?,
                             };
                             if kind == CellType::Error {
                                 if !criteria.error_as_null {
