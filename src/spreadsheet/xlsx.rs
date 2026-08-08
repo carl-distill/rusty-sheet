@@ -128,7 +128,7 @@ impl XlsxSpreadsheet {
             let mut col = 0_usize;
             let mut kind = CellType::default();
             let mut value = String::new();
-            let mut reader = self.zip.xml_reader(zip_path)?.expect(sheet_name);
+            let mut reader = required_xml_reader(&mut self.zip, zip_path)?;
 
             match_xml_events!(reader => {
                 Event::End(event) if event.name() == TAG_ROW => {
@@ -867,6 +867,23 @@ mod tests {
 
         let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
         let result = spreadsheet.read_sheets(&default_criteria());
+
+        std::fs::remove_file(path).unwrap();
+        let error = match result {
+            Ok(_) => panic!("expected missing sheet XML error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("xl/worksheets/sheet1.xml"));
+        assert!(error.contains("missing or corrupted"));
+    }
+
+    #[test]
+    fn missing_sheet_xml_returns_error_while_streaming() {
+        let path = invalid_workbook_path("missing-sheet-streaming");
+        write_missing_sheet_workbook(&path);
+
+        let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
+        let result = spreadsheet.stream_sheets(&default_criteria(), &mut |_| true);
 
         std::fs::remove_file(path).unwrap();
         let error = match result {
