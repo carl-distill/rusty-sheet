@@ -544,21 +544,11 @@ mod tests {
 
     #[test]
     fn invalid_style_index_returns_error() {
-        let path = invalid_style_workbook_path();
+        let path = invalid_workbook_path("style");
         write_invalid_style_workbook(&path);
 
         let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
-        let result = spreadsheet.read_sheets(&Criteria {
-            sheet_name_patterns: None,
-            sheet_limit: None,
-            range: None,
-            rows_limit: None,
-            nulls: HashSet::from(["".to_string()]),
-            error_as_null: false,
-            skip_empty_rows: false,
-            end_at_empty_row: false,
-            spread_merged_cells: false,
-        });
+        let result = spreadsheet.read_sheets(&default_criteria());
 
         std::fs::remove_file(path).unwrap();
         let error = match result {
@@ -570,18 +560,50 @@ mod tests {
         assert!(error.contains("workbook defines 1 styles"));
     }
 
-    fn invalid_style_workbook_path() -> PathBuf {
+    #[test]
+    fn invalid_shared_string_index_returns_error() {
+        let path = invalid_workbook_path("shared-string");
+        write_invalid_shared_string_workbook(&path);
+
+        let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
+        let result = spreadsheet.analyze_sheets(true, &default_criteria(), &Vec::new());
+
+        std::fs::remove_file(path).unwrap();
+        let error = match result {
+            Ok(_) => panic!("expected invalid shared string index error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Sheet1!A1"));
+        assert!(error.contains("invalid shared string index 999"));
+    }
+
+    fn invalid_workbook_path(kind: &str) -> PathBuf {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("rusty-sheet-invalid-style-{id}.xlsx"))
+        std::env::temp_dir().join(format!("rusty-sheet-invalid-{kind}-{id}.xlsx"))
+    }
+
+    fn default_criteria() -> Criteria {
+        Criteria {
+            sheet_name_patterns: None,
+            sheet_limit: None,
+            range: None,
+            rows_limit: None,
+            nulls: HashSet::from(["".to_string()]),
+            error_as_null: false,
+            skip_empty_rows: false,
+            end_at_empty_row: false,
+            spread_merged_cells: false,
+        }
     }
 
     fn write_invalid_style_workbook(path: &Path) {
         let file = File::create(path).unwrap();
         let mut zip = ZipWriter::new(file);
-        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let rows = (2..11)
             .map(|row| format!("<row r=\"{row}\"><c r=\"A{row}\"><v>{row}</v></c></row>"))
             .collect::<String>();
@@ -634,6 +656,67 @@ mod tests {
 </styleSheet>"#.to_string(),
             ),
             ("xl/worksheets/sheet1.xml", sheet),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn write_invalid_shared_string_workbook(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+        for (name, content) in [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>"#.to_string(),
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#.to_string(),
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#.to_string(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>"#.to_string(),
+            ),
+            (
+                "xl/sharedStrings.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
+  <si><t>name</t></si>
+</sst>"#.to_string(),
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" t="s"><v>999</v></c></row></sheetData>
+</worksheet>"#.to_string(),
+            ),
         ] {
             zip.start_file(name, options).unwrap();
             zip.write_all(content.as_bytes()).unwrap();
