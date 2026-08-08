@@ -208,9 +208,17 @@ impl Spreadsheet for XlsxSpreadsheet {
                     col_count = 0;
                 }
                 Event::Start(event) if event.name() == TAG_CELL => {
-                    (row, col) = event.get_attribute_value("r")?
-                        .and_then(|reference| reference_to_index(&reference))
-                        .unwrap_or((row_count, col_count));
+                    if let Some(reference) = event.get_attribute_value("r")? {
+                        (row, col) = reference_to_index(&reference).ok_or_else(|| {
+                            SpreadsheetError::CellReferenceError(
+                                sheet.file_name.to_owned(),
+                                sheet.name.to_owned(),
+                                reference.to_string(),
+                            )
+                        })?;
+                    } else {
+                        (row, col) = (row_count, col_count);
+                    }
                     col_count += 1;
                     if sheet.after_row_upper_bound(row) {
                         break;
@@ -577,6 +585,23 @@ mod tests {
         assert!(error.contains("invalid shared string index 999"));
     }
 
+    #[test]
+    fn invalid_cell_reference_returns_error() {
+        let path = invalid_workbook_path("cell-reference");
+        write_invalid_cell_reference_workbook(&path);
+
+        let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
+        let result = spreadsheet.read_sheets(&default_criteria());
+
+        std::fs::remove_file(path).unwrap();
+        let error = match result {
+            Ok(_) => panic!("expected invalid cell reference error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Sheet1"));
+        assert!(error.contains("invalid cell reference 'XFE1'"));
+    }
+
     fn invalid_workbook_path(kind: &str) -> PathBuf {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -715,6 +740,58 @@ mod tests {
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData><row r="1"><c r="A1" t="s"><v>999</v></c></row></sheetData>
+</worksheet>"#.to_string(),
+            ),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn write_invalid_cell_reference_workbook(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+        for (name, content) in [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#.to_string(),
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#.to_string(),
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#.to_string(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#.to_string(),
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="XFE1" t="inlineStr"><is><t>value</t></is></c></row></sheetData>
 </worksheet>"#.to_string(),
             ),
         ] {

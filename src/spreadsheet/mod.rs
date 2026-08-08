@@ -46,6 +46,29 @@ pub(crate) fn resolve_number_format(
     })
 }
 
+#[cfg(test)]
+mod number_format_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_style_with_out_of_range_column_returns_error() {
+        let error = resolve_number_format(
+            &[CellType::Number],
+            "workbook.xlsb",
+            "Sheet1",
+            10,
+            16_384,
+            999,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Cell '[workbook.xlsb]Sheet1!R11C16385': invalid style index 999; workbook defines 1 styles"
+        );
+    }
+}
+
 pub(crate) fn resolve_shared_string<'a>(
     shared_strings: &'a [String],
     mappings: &HashMap<usize, usize>,
@@ -127,6 +150,10 @@ pub(crate) enum SpreadsheetError {
     /// Error indicating a shared string index is outside the workbook's shared string table.
     #[error("Cell '[{0}]{1}!{2}': invalid shared string index {3}")]
     CellSharedStringIndexError(String, String, String, usize),
+
+    /// Error indicating a worksheet cell reference is outside the supported spreadsheet bounds.
+    #[error("Sheet '[{0}]{1}': invalid cell reference '{2}'")]
+    CellReferenceError(String, String, String),
 }
 
 pub(crate) trait Spreadsheet {
