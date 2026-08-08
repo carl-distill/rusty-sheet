@@ -172,7 +172,7 @@ impl Spreadsheet for XlsxSpreadsheet {
             };
 
             // Single pass: Read cells and collect merged cell ranges
-            let mut reader = self.zip.xml_reader(zip_path)?.expect(sheet_name);
+            let mut reader = required_xml_reader(&mut self.zip, zip_path)?;
             let mut in_merge_cells = false;
             
             match_xml_events!(reader => {
@@ -383,8 +383,7 @@ impl Spreadsheet for XlsxSpreadsheet {
 /// Tuple of (worksheets, is_1904_date_system) where worksheets are (name, zip_path) pairs
 fn load_workbook(zip: &mut ZipArchive<UnifiedReader>) -> Result<(Vec<(String, String)>, bool), RustySheetError> {
     let relationships = load_relationships(zip, "xl/_rels/workbook.xml.rels")?;
-    let mut reader = zip.xml_reader("xl/workbook.xml")?
-        .ok_or_else(|| SpreadsheetError::FileError("xl/workbook.xml".to_string()))?;
+    let mut reader = required_xml_reader(zip, "xl/workbook.xml")?;
     let mut sheets: Vec<(String, String)> = Vec::new();
     let mut is_1904 = false;
     match_xml_events!(reader => {
@@ -503,6 +502,15 @@ fn parse_merge_range(range_ref: &str) -> Option<(usize, usize, usize, usize)> {
     Some((top_row, top_col, bottom_row, bottom_col))
 }
 
+fn required_xml_reader<'a>(
+    zip: &'a mut ZipArchive<UnifiedReader>,
+    path: &str,
+) -> Result<XmlReader<BufReader<ZipFile<'a, UnifiedReader>>>, RustySheetError> {
+    zip.xml_reader(path)?.ok_or_else(|| {
+        RustySheetError::from(SpreadsheetError::FileError(path.to_string()))
+    })
+}
+
 /// Reads string value from XML content, handling text and CDATA sections
 ///
 /// Extracts string content from XML elements, skipping phonetic text annotations
@@ -617,6 +625,23 @@ mod tests {
         };
         assert!(error.contains("Sheet1!A1"));
         assert!(error.contains("parse 'not-a-number' to Date(1900) failed"));
+    }
+
+    #[test]
+    fn missing_sheet_xml_returns_error() {
+        let path = invalid_workbook_path("missing-sheet");
+        write_missing_sheet_workbook(&path);
+
+        let mut spreadsheet = XlsxSpreadsheet::open(path.to_str().unwrap()).unwrap();
+        let result = spreadsheet.read_sheets(&default_criteria());
+
+        std::fs::remove_file(path).unwrap();
+        let error = match result {
+            Ok(_) => panic!("expected missing sheet XML error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("xl/worksheets/sheet1.xml"));
+        assert!(error.contains("missing or corrupted"));
     }
 
     fn invalid_workbook_path(kind: &str) -> PathBuf {
@@ -871,6 +896,51 @@ mod tests {
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData><row r="1"><c r="A1" s="0"><v>not-a-number</v></c></row></sheetData>
 </worksheet>"#.to_string(),
+            ),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn write_missing_sheet_workbook(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+        for (name, content) in [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#.to_string(),
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#.to_string(),
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#.to_string(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#.to_string(),
             ),
         ] {
             zip.start_file(name, options).unwrap();
